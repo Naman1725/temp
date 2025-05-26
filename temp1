@@ -1,0 +1,698 @@
+pip install psycopg2-binary pandas plotly openai azure-storage-blob python-dotenv
+
+import os
+import re
+import json
+import psycopg2
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from io import BytesIO
+from datetime import datetime
+from azure.storage.blob import BlobServiceClient
+from openai import AzureOpenAI
+
+# ----------------------------
+# Configuration
+# ----------------------------
+POSTGRES_CONFIG = {
+    "host": "localhost",
+    "port": "5432",
+    "database": "KChat3",
+    "user": "postgres",
+    "password": "1718730naman"
+}
+
+AZURE_CONFIG = {
+    "conn_str": "DefaultEndpointsProtocol=https;AccountName=gptstgciuat;AccountKey=qtFH+t4+2VrW0fZJAYO+QG+f7kT1kALsVO@UPKKLFnd5bDiWzgZYYdwYazTGX4c/kJM6FIeyTkiP+AStXkaWsQ==;EndpointSuffix=core.windows.net",
+    "container": "fileupload-aashu",
+    "results_folder": "query_results"
+}
+
+OPENAI_CONFIG = {
+    "api_key": "888cf@ccab8445b39c6d8767a7e2c433",
+    "endpoint": "https://entgptaiuat.openai.azure.com",
+    "api_version": "2023-07-01-preview",
+    "deployment": "gpt-40-mini"
+}
+
+
+
+# ----------------------------
+# Initialize Services
+# ----------------------------
+class DatabaseManager:
+    def __enter__(self):
+        self.conn = psycopg2.connect(**POSTGRES_CONFIG)
+        return self.conn.cursor()
+   
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.conn.commit()
+        self.conn.close()
+
+class AzureStorage:
+    def __init__(self):
+        self.client = BlobServiceClient.from_connection_string(
+            AZURE_CONFIG["conn_str"],
+            max_single_put_size=4*1024*1024
+        )
+   
+    def upload_df(self, df, blob_path):
+        container = self.client.get_container_client(AZURE_CONFIG["container"])
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        container.upload_blob(name=blob_path, data=csv_data, overwrite=True)
+
+class AIService:
+    def __init__(self):
+        self.client = AzureOpenAI(
+            api_key=OPENAI_CONFIG["api_key"],
+            api_version=OPENAI_CONFIG["api_version"],
+            azure_endpoint=OPENAI_CONFIG["endpoint"]
+        )
+
+
+
+
+
+# ----------------------------
+# Core Functions
+# ----------------------------
+def summarize_table(df: pd.DataFrame) -> str:
+    """Generate natural language data description"""
+    try:
+        if df.empty:
+            return "No data to summarize"
+           
+        sample = df.head(3).to_markdown(index=False)
+       
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{
+                "role": "user",
+                "content": f"""Describe this table in 4-5 simple lines:
+1. Mention column names/types
+2. Note obvious patterns
+3. Keep it conversational
+
+Data Sample:
+{sample}
+
+Summary:"""
+            }],
+            temperature=0.4,
+            max_tokens=200
+        )
+        return response.choices[0].message.content.strip()
+       
+    except Exception as e:
+        return "Data summary unavailable"
+
+def generate_sql(nl_query: str) -> tuple[str, str]:
+    """Convert NL to SQL with schema context"""
+    try:
+        with DatabaseManager() as cursor:
+            cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+            tables = [row[0] for row in cursor.fetchall()]
+           
+            schema_context = []
+            for table in tables:
+                df = pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT 50', cursor.connection)
+                schema_context.append(
+                    f"Table: {table}\nColumns: {', '.join(df.columns)}\n"
+                    f"Sample Rows:\n{df.head(5).to_markdown(index=False)}\n"
+                )
+
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{
+                "role": "user",
+                "content": f"""Convert to PostgreSQL SQL:
+1. Use EXACT column/table names
+2. Wrap uppercase names in quotes
+3. Explain first, then SQL
+
+Schema Context:
+{''.join(schema_context)}
+
+Query: {nl_query}"""
+            }],
+            temperature=0.1,
+            max_tokens=500
+        )
+
+        content = response.choices[0].message.content
+        sql_match = re.search(r'```sql\n(.*?)\n```', content, re.DOTALL)
+        if not sql_match:
+            raise ValueError("No SQL found")
+           
+        sql = sql_match.group(1).strip()
+        explanation = content.split('```')[0].strip()
+       
+        return explanation, sql
+       
+    except Exception as e:
+        raise RuntimeError(f"SQL generation failed: {str(e)}")
+
+
+def execute_and_visualize(sql: str) -> pd.DataFrame:
+    """Execute query and visualize results"""
+    try:
+        with DatabaseManager() as cursor:
+            cursor.execute(f"EXPLAIN {sql}")
+            result_df = pd.read_sql_query(sql, cursor.connection)
+           
+            if result_df.empty:
+                print("Query executed but no results")
+                return pd.DataFrame()
+               
+            fig = go.Figure(data=[go.Table(
+                header=dict(values=list(result_df.columns),
+                          fill_color='#003380',
+                          font_color='white',
+                          align='left'),
+                cells=dict(values=[result_df[col] for col in result_df.columns],
+                         fill_color='#E6FBFF',
+                         align='left')
+            )])
+		
+		# give it e.g. 150px per column, or cap at something reasonable
+		n_cols = len(result_df.columns)
+		fig.update_layout(
+    			autosize=False,
+    			width=max(150*n_cols, 800),  # e.g. 150px per column
+    			height=400,
+    			margin=dict(l=0, r=0, t=20, b=20)
+		)
+
+
+
+            fig.show()
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            blob_path = f"{AZURE_CONFIG['results_folder']}/result_{timestamp}.csv"
+            AzureStorage().upload_df(result_df, blob_path)
+            print(f"Results uploaded to Azure: {blob_path}")
+           
+            print("\n📋 Data Summary:")
+            print(summarize_table(result_df))
+           
+            return result_df
+           
+    except psycopg2.Error as e:
+        raise RuntimeError(f"Database error: {str(e)}")
+
+def generate_insights():
+    """Analyze latest result"""
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+       
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+       
+        if not blobs:
+            print("No results found")
+            return
+           
+        latest = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest.name).readall())
+       
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{
+                "role": "user",
+                "content": f"""Provide 5 key insights:
+               
+{df.head(50).to_markdown(index=False)}
+
+Format as:
+1. [Insight] - [Explanation]
+2. ..."""
+            }],
+            temperature=0.7
+        )
+        print("\n🔍 Key Insights:\n" + response.choices[0].message.content)
+       
+    except Exception as e:
+        print(f"Insights error: {str(e)}")
+
+def generate_charts_intelligent():
+    """Intelligent chart generation using LLM recommendations"""
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+       
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No data available for charts")
+            return []
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+       
+        if df.empty:
+            print("Empty dataset - cannot generate charts")
+            return []
+
+        summary = {
+            "dtypes": df.dtypes.astype(str).to_dict(),
+            "sample": df.head(5).to_markdown(index=False)
+        }
+       
+        prompt = f"""Data summary:
+Columns and types: {json.dumps(summary['dtypes'], indent=2)}
+Sample rows:
+{summary['sample']}
+
+Suggest up to 2 charts from: line, bar, scatter, pie, treemap, heatmap.
+Respond ONLY with valid JSON matching this schema:
+{{
+  "charts": [
+    {{
+      "type": "<chart_type>",
+      "x": "<column_for_x_axis>",
+      "y": "<column_for_y_axis>",
+      "z": "<column_for_z_if_applicable>",  # optional
+      "reason": "<brief_explanation>"
+    }}
+  ]
+}}"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG['deployment'],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=500
+        )
+        text = resp.choices[0].message.content.strip()
+
+        try:
+            advice = json.loads(text)
+        except json.JSONDecodeError:
+            print("Failed to parse LLM response:")
+            print(text)
+            return []
+
+        charts = advice.get("charts", [])
+        if not charts:
+            print("No charts suggested")
+            return []
+
+        figs = []
+        valid_columns = set(df.columns)
+       
+        for ch in charts:
+            try:
+                ctype = ch['type']
+                x = ch.get('x')
+                y = ch.get('y')
+                z = ch.get('z')
+                title = ch.get('reason') or f"{ctype}: {y} vs {x}" if x and y else f"{ctype} Chart"
+
+                required = []
+                if ctype in ['bar', 'line', 'scatter']:
+                    required = [x, y]
+                elif ctype == 'pie':
+                    required = [x, y]
+                elif ctype == 'treemap':
+                    required = [y]
+                elif ctype == 'heatmap':
+                    required = [x, y]
+               
+                if any(col not in valid_columns for col in required if col):
+                    print(f"Skipping {ctype} chart - invalid columns")
+                    continue
+
+                if ctype == 'bar':
+                    figs.append(px.bar(df, x=x, y=y, title=title))
+                elif ctype == 'scatter':
+                    figs.append(px.scatter(df, x=x, y=y, title=title))
+                elif ctype == 'line':
+                    figs.append(px.line(df, x=x, y=y, title=title))
+                elif ctype == 'pie':
+                    figs.append(px.pie(df, names=x, values=y, title=title))
+                elif ctype == 'treemap':
+                    path = [p for p in [x, z] if p]
+                    figs.append(px.treemap(df, path=path, values=y, title=title))
+                elif ctype == 'heatmap':
+                    figs.append(px.density_heatmap(df, x=x, y=y, z=z, title=title))
+               
+            except Exception as e:
+                print(f"Failed to create {ctype} chart: {str(e)}")
+                continue
+
+        for fig in figs:
+            fig.show()
+
+        return figs
+
+    except Exception as e:
+        print(f"Chart generation failed: {str(e)}")
+        return []
+
+
+
+
+
+
+---------------------------------------------------
+def generate_follow_up_questions(user_query: str) -> list[str]:
+    """Suggest next questions"""
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG['container'])
+       
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+       
+        if not blobs:
+            return []
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+       
+        if df.empty:
+            return []
+
+        sample = df.head(10).to_markdown(index=False)
+        prompt = f"""Original query: "{user_query.strip()}"
+Data sample:
+{sample}
+
+Suggest 4-5 natural follow-up questions. Return ONLY JSON array: ["question1", ...]"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG['deployment'],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=350,
+            response_format={"type": "json_object"}
+        )
+       
+        raw = resp.choices[0].message.content.strip()
+        try:
+            return json.loads(raw).get("questions", [])[:5]
+        except:
+            return []
+           
+    except Exception as e:
+        print(f"Questions error: {str(e)}")
+        return []
+
+def log_query(user_query: str, sql_query: str):
+    """Store in query history"""
+    try:
+        with DatabaseManager() as cursor:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS query_history (
+                    id SERIAL PRIMARY KEY,
+                    user_query TEXT NOT NULL,
+                    sql_query TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                INSERT INTO query_history (user_query, sql_query)
+                VALUES (%s, %s)
+            """, (user_query, sql_query))
+    except Exception as e:
+        print(f"History logging failed: {str(e)}")
+
+def get_query_history(limit: int = 50) -> list[dict]:
+    """Retrieve query history"""
+    try:
+        with DatabaseManager() as cursor:
+            cursor.execute("""
+                SELECT created_at, user_query, sql_query
+                FROM query_history
+                ORDER BY created_at DESC
+                LIMIT %s
+            """, (limit,))
+            return [{
+                "timestamp": row[0],
+                "user_query": row[1],
+                "sql_query": row[2]
+            } for row in cursor.fetchall()]
+    except Exception as e:
+        print(f"History retrieval failed: {str(e)}")
+        return []
+
+
+def generate_insights(user_query: str, sql_query: str):
+    """Analyze latest result with context of user's request"""
+    try:
+        # Fetch latest result CSV from Azure Blob Storage
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No results found")
+            return
+
+        latest = blobs[0]
+        data_bytes = container.download_blob(latest.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+
+        if df.empty:
+            print("Latest result is empty – nothing to analyze")
+            return
+
+        # Build prompt including user question, SQL, and data sample
+        prompt = f"""
+User Question:
+{user_query}
+
+Generated SQL:
+{sql_query}
+
+Data Sample (first 50 rows):
+{df.head(50).to_markdown(index=False)}
+
+Now, provide 5 concise bullet‑point insights that:
+  - Analyze this data,
+  - Clearly tie back to the user’s original request and SQL logic.
+Format each as:
+- [Insight] – [Why it matters]
+"""
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=300
+        )
+
+        insights = response.choices[0].message.content.strip()
+        print("\n🔍 Key Insights:\n" + insights)
+
+    except Exception as e:
+        print(f"Insights error: {str(e)}")
+
+
+def GenerateChartsCustom(user_query: str, sql_query: str):
+ """Improved chart generation with LLM, validation, deduplication, and fallbacks"""
+ try:
+ # Initialize Azure and fetch latest result
+ azure = AzureStorage()
+ container = azure.client.get_container_client(AZURE_CONFIG["container"])
+ blobs = sorted(
+ [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+ key=lambda x: x.creation_time,
+ reverse=True
+ )
+ if not blobs:
+ print("❌ No data available for chart generation.")
+ return []
+
+ latest_blob = blobs[0]
+ data_bytes = container.download_blob(latest_blob.name).readall()
+ df = pd.read_csv(BytesIO(data_bytes))
+
+ if df.empty:
+ print("⚠️ The latest dataset is empty. No charts can be generated.")
+ return []
+
+ # Data summary to send to LLM
+ dtypes_summary = df.dtypes.astype(str).to_dict()
+ sample_rows = df.head(5).to_markdown(index=False)
+
+ # LLM Prompt
+ prompt = f"""
+You are a data analyst assistant. Your job is to suggest intelligent charts from a given dataset to help visualize the results of a user's query.
+IMPORTANT:
+- Exclude columns with names like 'key', 'password', 'token', 'card_number', 'credit_card' or anything that sounds private or sensitive.
+- Suggest between 0 to 5 charts only.
+- Use valid and numeric fields where appropriate.
+- Try to align your chart choices with the user's original natural language question and the SQL query.
+
+User Question: {user_query}
+
+Generated SQL: {sql_query}
+
+Column Types: {json.dumps(dtypes_summary, indent=2)}
+
+Sample Data:
+{sample_rows}
+
+Now suggest 0-5 charts in this exact JSON format:
+{{
+ "charts": [
+ {{
+ "type": "<bar|line|scatter|pie|treemap|heatmap>",
+ "x": "<column_name_for_x_axis>",
+ "y": "<column_name_for_y_axis>",
+ "z": "<optional_column_for_z_axis>",
+ "reason": "<why this chart is useful>"
+ }}
+ ]
+}}
+ """
+
+ ai = AIService()
+ response = ai.client.chat.completions.create(
+ model=OPENAI_CONFIG["deployment"],
+ messages=[{"role": "user", "content": prompt}],
+ temperature=0.3,
+ max_tokens=800
+ )
+
+ text = response.choices[0].message.content.strip()
+
+ # Parse LLM output safely
+ try:
+ match = re.search(r"\{.*\}", text, re.DOTALL)
+ if match:
+ chart_json = json.loads(match.group(0))
+ else:
+ raise ValueError("No JSON found in LLM response.")
+ except Exception as e:
+ print(f"❌ JSON parsing error: {e}")
+ chart_json = {}
+
+ charts = chart_json.get("charts", [])
+ if not charts:
+ print("⚠️ No charts suggested by the model.")
+ charts = []
+
+ figs = []
+ seen_pairs = set()
+ valid_columns = set(df.columns)
+
+ def is_valid_numeric(col_name):
+ return col_name in df.columns and pd.api.types.is_numeric_dtype(df[col_name])
+
+ for ch in charts:
+ try:
+ ctype = ch['type']
+ x = ch.get('x')
+ y = ch.get('y')
+ z = ch.get('z', None)
+ reason = ch.get('reason', f"{ctype} chart")
+
+ # Skip invalid or duplicate combos
+ if (ctype, x, y) in seen_pairs:
+ continue
+ if not x or not y or x not in valid_columns or y not in valid_columns:
+ continue
+ if ctype in ['pie', 'bar', 'line', 'scatter', 'heatmap', 'treemap'] and not is_valid_numeric(y):
+ continue
+ seen_pairs.add((ctype, x, y))
+
+ # Plot chart
+ if ctype == 'bar':
+ figs.append(px.bar(df, x=x, y=y, title=reason))
+ elif ctype == 'line':
+ figs.append(px.line(df, x=x, y=y, title=reason))
+ elif ctype == 'scatter':
+ figs.append(px.scatter(df, x=x, y=y, title=reason))
+ elif ctype == 'pie':
+ figs.append(px.pie(df, names=x, values=y, title=reason))
+ elif ctype == 'treemap':
+ path = [p for p in [x, z] if p and p in valid_columns]
+ figs.append(px.treemap(df, path=path, values=y, title=reason))
+ elif ctype == 'heatmap':
+ figs.append(px.density_heatmap(df, x=x, y=y, z=z if z in valid_columns else None, title=reason))
+
+ except Exception as e:
+ print(f"⚠️ Failed to create {ch.get('type', 'unknown')} chart: {e}")
+ continue
+
+ # Fallback chart if none succeeded
+ if not figs:
+ numeric_cols = [col for col in df.columns if is_valid_numeric(col)]
+ if len(numeric_cols) >= 2:
+ x, y = numeric_cols[0], numeric_cols[1]
+ print("ℹ️ No valid LLM chart. Showing fallback bar chart.")
+ figs.append(px.bar(df, x=x, y=y, title="Fallback Bar Chart"))
+ else:
+ print("❌ No numeric columns available for fallback chart.")
+
+ for fig in figs:
+ try:
+ fig.show()
+ except Exception as e:
+ print(f"⚠️ Chart rendering issue: {e}")
+
+ return figs
+
+ except Exception as e:
+ print(f"🔥 Critical chart generation error: {e}")
+ return []
+
+
+
+# ----------------------------
+# Main Pipeline
+# ----------------------------
+def main():
+    try:
+        nl_query = input("Enter your query: ").strip()
+       
+        print("\nGenerating SQL...")
+        explanation, sql = generate_sql(nl_query)
+       
+        log_query(nl_query, sql)
+        print(f"\nExplanation: {explanation}")
+        print(f"Generated SQL: {sql}")
+       
+        print("\nExecuting query...")
+        result_df = execute_and_visualize(sql)
+       
+        print("\nGenerating insights...")
+        generate_insights()
+       
+        print("\nCreating charts...")
+        generate_charts_intelligent()
+       
+        print("\nSuggested follow-up questions:")
+        questions = generate_follow_up_questions(nl_query)
+        for i, q in enumerate(questions, 1):
+            print(f"{i}. {q}")
+       
+        print("\nRecent history:")
+        for idx, entry in enumerate(get_query_history(3), 1):
+            print(f"{idx}. [{entry['timestamp']}] {entry['user_query']}")
+
+    except Exception as e:
+        print(f"\nError: {str(e)}")
