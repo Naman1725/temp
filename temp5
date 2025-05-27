@@ -1,0 +1,134 @@
+# Install required packages (only once)
+# pip install azure-storage-blob pandas requests langchain openai
+
+import os
+import pandas as pd
+import requests
+from io import BytesIO
+from datetime import datetime, timedelta
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from langchain.agents import Tool, initialize_agent
+from langchain.agents.agent_types import AgentType
+from langchain.chat_models import AzureChatOpenAI
+
+# ----------------------------
+# 🔐 Azure Config (REPLACE THESE)
+# ----------------------------
+AZURE_STORAGE_ACCOUNT_NAME = "yourstorageaccount"
+AZURE_STORAGE_KEY = "your_storage_key"
+AZURE_CONTAINER_NAME = "yourcontainer"
+AZURE_CONN_STR = "your_connection_string"
+AZURE_RESULTS_FOLDER = "results"
+
+AZURE_OPENAI_API_KEY = "your_openai_key"
+AZURE_OPENAI_ENDPOINT = "https://your-openai-resource.openai.azure.com"
+AZURE_OPENAI_DEPLOYMENT = "your_deployment_name"
+AZURE_OPENAI_API_VERSION = "2024-04-01-preview"
+
+# ----------------------------
+# 🔁 Step 1: Upload CSV to Azure Blob
+# ----------------------------
+def upload_csv_to_blob(df: pd.DataFrame) -> str:
+    blob_service_client = BlobServiceClient.from_connection_string(AZURE_CONN_STR)
+    container_client = blob_service_client.get_container_client(AZURE_CONTAINER_NAME)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    blob_name = f"{AZURE_RESULTS_FOLDER}/result_{timestamp}.csv"
+
+    csv_data = df.to_csv(index=False).encode('utf-8')
+    container_client.upload_blob(name=blob_name, data=csv_data, overwrite=True)
+    print(f"✅ CSV uploaded to: {blob_name}")
+    return blob_name
+
+# ----------------------------
+# 🔐 Step 2: Generate SAS URL for the CSV
+# ----------------------------
+def generate_sas_url(blob_name: str, expiry_minutes=30) -> str:
+    sas_token = generate_blob_sas(
+        account_name=AZURE_STORAGE_ACCOUNT_NAME,
+        container_name=AZURE_CONTAINER_NAME,
+        blob_name=blob_name,
+        account_key=AZURE_STORAGE_KEY,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(minutes=expiry_minutes)
+    )
+    return f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net/{AZURE_CONTAINER_NAME}/{blob_name}?{sas_token}"
+
+# ----------------------------
+# 🤖 Step 3: Define LangChain Tool to Analyze CSV
+# ----------------------------
+def analyze_csv_from_url(url: str) -> str:
+    try:
+        response = requests.get(url)
+        if response.status_code != 200:
+            return f"Failed to download CSV. Status code: {response.status_code}"
+        df = pd.read_csv(BytesIO(response.content))
+        if df.empty:
+            return "The CSV file is empty."
+
+        summary = df.describe(include='all').to_string()
+        sample = df.head(5).to_string(index=False)
+        return f"✅ CSV Analyzed\n\nSample:\n{sample}\n\nSummary:\n{summary}"
+    except Exception as e:
+        return f"❌ Error processing CSV: {str(e)}"
+
+csv_tool = Tool(
+    name="CSVAnalyzer",
+    func=analyze_csv_from_url,
+    description="Use this tool when you are given a CSV file URL. It will load and summarize the data."
+)
+
+# ----------------------------
+# 🧠 Step 4: Initialize Azure OpenAI Agent
+# ----------------------------
+llm = AzureChatOpenAI(
+    openai_api_key=AZURE_OPENAI_API_KEY,
+    openai_api_base=AZURE_OPENAI_ENDPOINT,
+    deployment_name=AZURE_OPENAI_DEPLOYMENT,
+    openai_api_version=AZURE_OPENAI_API_VERSION,
+    temperature=0.3
+)
+
+agent = initialize_agent(
+    tools=[csv_tool],
+    llm=llm,
+    agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION,
+    verbose=True
+)
+
+# ----------------------------
+# 🚀 Step 5: Upload → Generate SAS → Run Agent
+# ----------------------------
+def run_pipeline(user_query: str, df: pd.DataFrame):
+    try:
+        # Upload CSV and generate SAS URL
+        blob_name = upload_csv_to_blob(df)
+        sas_url = generate_sas_url(blob_name)
+        print(f"\n🔗 SAS URL: {sas_url}\n")
+
+        # Send query to agent
+        prompt = f"""
+The user uploaded a CSV file here: {sas_url}
+
+Please analyze the full dataset and give 5 insights based on the user's query:
+{user_query}
+"""
+        response = agent.run(prompt)
+        print("\n🔍 Final Insights:\n", response)
+
+    except Exception as e:
+        print(f"🔥 Pipeline failed: {e}")
+
+# ----------------------------
+# ✨ Example Usage
+# ----------------------------
+if __name__ == "__main__":
+    # Replace this with your own DataFrame
+    sample_df = pd.DataFrame({
+        "Region": ["North", "South", "East", "West", "North"],
+        "Sales": [1200, 1500, 1100, 1800, 1300],
+        "Month": ["Jan", "Jan", "Jan", "Jan", "Feb"]
+    })
+
+    user_question = "Find trends in sales across regions and months."
+    run_pipeline(user_question, sample_df)
