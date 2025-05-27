@@ -1,0 +1,202 @@
+# First install these packages (if not done)
+# !pip install psycopg2-binary pandas plotly openai azure-storage-blob python-dotenv
+
+import os
+import re
+import json
+import psycopg2
+import pandas as pd
+import plotly.graph_objects as go
+from io import BytesIO
+from datetime import datetime, timedelta
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from openai import AzureOpenAI
+
+# ----------------------------
+# Configuration
+# ----------------------------
+POSTGRES_CONFIG = {
+    "host": "localhost",
+    "port": "5432",
+    "database": "your_database_name",
+    "user": "postgres",
+    "password": "your_password"
+}
+
+AZURE_CONFIG = {
+    "conn_str": "your_azure_blob_connection_string",
+    "container": "your_container_name",
+    "results_folder": "results"
+}
+
+OPENAI_CONFIG = {
+    "api_key": "your_openai_api_key",
+    "endpoint": "https://your-openai-resource.openai.azure.com/",
+    "api_version": "2024-04-01-preview",
+    "deployment": "your_deployment_name"
+}
+
+# Must set your storage account key as environment variable
+os.environ["AZURE_STORAGE_KEY"] = "your_storage_account_key"
+
+# ----------------------------
+# Service Classes
+# ----------------------------
+class DatabaseManager:
+    def __enter__(self):
+        self.conn = psycopg2.connect(**POSTGRES_CONFIG)
+        return self.conn.cursor()
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.conn.commit()
+        self.conn.close()
+
+class AzureStorage:
+    def __init__(self):
+        self.client = BlobServiceClient.from_connection_string(
+            AZURE_CONFIG["conn_str"],
+            max_single_put_size=4 * 1024 * 1024
+        )
+
+    def upload_df(self, df, blob_path):
+        container = self.client.get_container_client(AZURE_CONFIG["container"])
+        csv_data = df.to_csv(index=False).encode('utf-8')
+        container.upload_blob(name=blob_path, data=csv_data, overwrite=True)
+
+class AIService:
+    def __init__(self):
+        self.client = AzureOpenAI(
+            api_key=OPENAI_CONFIG["api_key"],
+            api_version=OPENAI_CONFIG["api_version"],
+            azure_endpoint=OPENAI_CONFIG["endpoint"]
+        )
+
+# ----------------------------
+# Utility
+# ----------------------------
+def generate_sas_url(blob_name: str, expiry_minutes: int = 15) -> str:
+    account_name = AZURE_CONFIG["conn_str"].split(";")[1].split("=")[1]
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=AZURE_CONFIG["container"],
+        blob_name=blob_name,
+        account_key=os.getenv("AZURE_STORAGE_KEY"),
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(minutes=expiry_minutes)
+    )
+    return f"https://{account_name}.blob.core.windows.net/{AZURE_CONFIG['container']}/{blob_name}?{sas_token}"
+
+# ----------------------------
+# Core Functions
+# ----------------------------
+def generate_sql(nl_query: str) -> tuple[str, str]:
+    with DatabaseManager() as cursor:
+        cursor.execute("SELECT table_name FROM information_schema.tables WHERE table_schema='public'")
+        tables = [row[0] for row in cursor.fetchall()]
+
+        schema_context = []
+        for table in tables:
+            df = pd.read_sql_query(f'SELECT * FROM "{table}" LIMIT 50', cursor.connection)
+            schema_context.append(
+                f"Table: {table}\nColumns: {', '.join(df.columns)}\nSample:\n{df.head(5).to_markdown(index=False)}\n"
+            )
+
+    ai = AIService()
+    response = ai.client.chat.completions.create(
+        model=OPENAI_CONFIG["deployment"],
+        messages=[{
+            "role": "user",
+            "content": f"""Convert this to SQL:
+{nl_query}
+
+Schema Context:
+{''.join(schema_context)}
+
+Be precise. Return explanation and SQL."""
+        }],
+        temperature=0.2,
+        max_tokens=500
+    )
+
+    content = response.choices[0].message.content
+    sql_match = re.search(r'```sql\n(.*?)\n```', content, re.DOTALL)
+    if not sql_match:
+        raise ValueError("No SQL found")
+
+    sql = sql_match.group(1).strip()
+    explanation = content.split('```')[0].strip()
+
+    return explanation, sql
+
+def execute_and_visualize(sql: str) -> tuple[pd.DataFrame, str]:
+    with DatabaseManager() as cursor:
+        cursor.execute(f"EXPLAIN {sql}")
+        result_df = pd.read_sql_query(sql, cursor.connection)
+
+        if result_df.empty:
+            print("Query executed but returned no data.")
+            return pd.DataFrame(), ""
+
+        fig = go.Figure(data=[go.Table(
+            header=dict(values=list(result_df.columns), fill_color='navy', font_color='white'),
+            cells=dict(values=[result_df[col] for col in result_df.columns], fill_color='lightblue')
+        )])
+        fig.update_layout(width=max(150 * len(result_df.columns), 800), height=400)
+        fig.show()
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        blob_path = f"{AZURE_CONFIG['results_folder']}/result_{timestamp}.csv"
+        AzureStorage().upload_df(result_df, blob_path)
+        print(f"\n✅ Results uploaded to Azure: {blob_path}")
+        return result_df, blob_path
+
+def generate_insights(user_query: str, sql_query: str, blob_path: str):
+    try:
+        sas_url = generate_sas_url(blob_path)
+        prompt = f"""
+You are a data analyst. The following CSV contains the result of a query:
+User Question: {user_query}
+SQL Used: {sql_query}
+
+You can access the full data here:
+{sas_url}
+
+Please provide 5 meaningful insights using the complete dataset. Format:
+1. [Insight] - [Explanation]
+"""
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.5,
+            max_tokens=500
+        )
+
+        insights = response.choices[0].message.content.strip()
+        print("\n🔍 Insights:\n" + insights)
+
+    except Exception as e:
+        print(f"Error during insights: {e}")
+
+# ----------------------------
+# Main Pipeline
+# ----------------------------
+def main():
+    try:
+        nl_query = input("📝 Enter your natural language query:\n").strip()
+
+        print("\n🔄 Converting to SQL...")
+        explanation, sql = generate_sql(nl_query)
+
+        print(f"\n🧠 Explanation: {explanation}")
+        print(f"🗃️ SQL: {sql}")
+
+        print("\n🚀 Running SQL and visualizing results...")
+        df, blob_path = execute_and_visualize(sql)
+
+        if not df.empty:
+            print("\n📊 Generating insights from full dataset...")
+            generate_insights(nl_query, sql, blob_path)
+
+    except Exception as e:
+        print(f"🔥 Pipeline error: {e}")
