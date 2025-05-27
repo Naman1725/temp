@@ -139,3 +139,186 @@ Suggest 0-5 charts in this JSON format:
     except Exception as e:
         print(f"🔥 Critical chart generation error: {e}")
         return []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+y axis
+
+
+
+
+
+def generate_charts_custom_scrollable(user_query: str, sql_query: str):
+    """Improved chart generation with scrollable layout and proper handling of datetime axes."""
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No data available for chart generation.")
+            return []
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+
+        if df.empty:
+            print("⚠️ The latest dataset is empty. No charts can be generated.")
+            return []
+
+        dtypes_summary = df.dtypes.astype(str).to_dict()
+        sample_rows = df.head(5).to_markdown(index=False)
+
+        prompt = f"""
+User Question: {user_query}
+
+Generated SQL: {sql_query}
+
+Column Types: {json.dumps(dtypes_summary, indent=2)}
+
+Sample Data:
+{sample_rows}
+
+Suggest 0-5 charts in this JSON format:
+{{
+ "charts": [
+ {{
+   "type": "<bar|line|scatter|pie|treemap|heatmap>",
+   "x": "<column_name_for_x_axis>",
+   "y": "<column_name_for_y_axis>",
+   "z": "<optional_column_for_z_axis>",
+   "reason": "<why this chart is useful>"
+ }}
+ ]
+}}"""
+
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800
+        )
+
+        text = response.choices[0].message.content.strip()
+
+        try:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            chart_json = json.loads(match.group(0)) if match else {}
+        except Exception as e:
+            print(f"❌ JSON parsing error: {e}")
+            chart_json = {}
+
+        charts = chart_json.get("charts", [])
+        if not charts:
+            print("⚠️ No charts suggested by the model.")
+            return []
+
+        figs_html = []
+        seen_pairs = set()
+        valid_columns = set(df.columns)
+
+        def is_valid_numeric(col_name):
+            return col_name in df.columns and pd.api.types.is_numeric_dtype(df[col_name])
+
+        for ch in charts:
+            try:
+                ctype = ch['type']
+                x = ch.get('x')
+                y = ch.get('y')
+                z = ch.get('z', None)
+                reason = ch.get('reason', f"{ctype} chart")
+
+                if (ctype, x, y) in seen_pairs:
+                    continue
+                if not x or not y or x not in valid_columns or y not in valid_columns:
+                    print(f"⚠️ Skipping {ctype} chart – invalid x or y: {x}, {y}")
+                    continue
+
+                # Skip charts where Y-axis is datetime (not meaningful)
+                if pd.api.types.is_datetime64_any_dtype(df[y]):
+                    print(f"⚠️ Skipping {ctype} chart – Y-axis is a datetime column ({y}).")
+                    continue
+
+                # For line chart: convert X to datetime if applicable
+                if ctype == 'line' and pd.api.types.is_object_dtype(df[x]):
+                    try:
+                        df[x] = pd.to_datetime(df[x], errors='coerce')
+                    except Exception as e:
+                        print(f"⚠️ Couldn't convert X-axis ({x}) to datetime: {e}")
+
+                # Validate numeric Y for most chart types
+                if ctype in ['bar', 'line', 'scatter', 'heatmap', 'treemap'] and not is_valid_numeric(y):
+                    print(f"⚠️ Skipping {ctype} chart – Y-axis ({y}) must be numeric.")
+                    continue
+
+                seen_pairs.add((ctype, x, y))
+
+                # Create the chart
+                if ctype == 'bar':
+                    fig = px.bar(df, x=x, y=y, title=reason)
+                elif ctype == 'line':
+                    fig = px.line(df, x=x, y=y, title=reason)
+                elif ctype == 'scatter':
+                    fig = px.scatter(df, x=x, y=y, title=reason)
+                elif ctype == 'pie':
+                    fig = px.pie(df, names=x, values=y, title=reason)
+                elif ctype == 'treemap':
+                    path = [p for p in [x, z] if p and p in valid_columns]
+                    fig = px.treemap(df, path=path, values=y, title=reason)
+                elif ctype == 'heatmap':
+                    fig = px.density_heatmap(df, x=x, y=y, z=z if z in valid_columns else None, title=reason)
+
+                figs_html.append(fig.to_html(full_html=False))
+
+            except Exception as e:
+                print(f"⚠️ Failed to create {ch.get('type', 'unknown')} chart: {e}")
+                continue
+
+        # Fallback
+        if not figs_html:
+            numeric_cols = [col for col in df.columns if is_valid_numeric(col)]
+            if len(numeric_cols) >= 2:
+                fig = px.bar(df, x=numeric_cols[0], y=numeric_cols[1], title="Fallback Bar Chart")
+                figs_html.append(fig.to_html(full_html=False))
+
+        # Scrollable chart display (for Jupyter/Colab)
+        from IPython.display import display, HTML
+        html_wrapper = f"""
+        <div style="overflow-x: auto; white-space: nowrap;">
+            {''.join([f'<div style="display:inline-block; margin-right:20px;">{fig}</div>' for fig in figs_html])}
+        </div>
+        """
+        display(HTML(html_wrapper))
+
+        return figs_html
+
+    except Exception as e:
+        print(f"🔥 Critical chart generation error: {e}")
+        return []
+
