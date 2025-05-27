@@ -170,7 +170,7 @@ y axis
 
 
 def generate_charts_custom_scrollable(user_query: str, sql_query: str):
-    """Improved chart generation with scrollable layout and proper handling of datetime axes."""
+    """Improved chart generation with datetime fix, Y variation check, and scrollable layout."""
     try:
         azure = AzureStorage()
         container = azure.client.get_container_client(AZURE_CONFIG["container"])
@@ -260,26 +260,37 @@ Suggest 0-5 charts in this JSON format:
                     print(f"⚠️ Skipping {ctype} chart – invalid x or y: {x}, {y}")
                     continue
 
-                # Skip charts where Y-axis is datetime (not meaningful)
+                # 🛠️ Check for datetime on Y-axis (not allowed)
                 if pd.api.types.is_datetime64_any_dtype(df[y]):
-                    print(f"⚠️ Skipping {ctype} chart – Y-axis is a datetime column ({y}).")
+                    print(f"⚠️ Skipping {ctype} chart – Y-axis is datetime ({y}).")
                     continue
 
-                # For line chart: convert X to datetime if applicable
-                if ctype == 'line' and pd.api.types.is_object_dtype(df[x]):
-                    try:
-                        df[x] = pd.to_datetime(df[x], errors='coerce')
-                    except Exception as e:
-                        print(f"⚠️ Couldn't convert X-axis ({x}) to datetime: {e}")
+                # 🛠️ Handle datetime X-axis properly
+                if ctype == 'line':
+                    if pd.api.types.is_object_dtype(df[x]) or df[x].dtype == 'int64':
+                        try:
+                            df[x] = pd.to_datetime(df[x], errors='coerce')
+                        except Exception:
+                            pass
+                    if pd.api.types.is_datetime64_any_dtype(df[x]):
+                        if df[x].nunique() > 1:
+                            df[x] = df[x].dt.floor('s')  # reduce timestamp precision
+                        else:
+                            print(f"⚠️ Skipping {ctype} chart – X-axis datetime has no variation.")
+                            continue
 
-                # Validate numeric Y for most chart types
+                # 🛠️ Ensure Y has variation
+                if df[y].nunique() <= 1:
+                    print(f"⚠️ Skipping {ctype} chart – Y-axis ({y}) has no variation.")
+                    continue
+
                 if ctype in ['bar', 'line', 'scatter', 'heatmap', 'treemap'] and not is_valid_numeric(y):
-                    print(f"⚠️ Skipping {ctype} chart – Y-axis ({y}) must be numeric.")
+                    print(f"⚠️ Skipping {ctype} chart – Y-axis must be numeric ({y}).")
                     continue
 
                 seen_pairs.add((ctype, x, y))
 
-                # Create the chart
+                # 🖼️ Generate chart
                 if ctype == 'bar':
                     fig = px.bar(df, x=x, y=y, title=reason)
                 elif ctype == 'line':
@@ -300,14 +311,14 @@ Suggest 0-5 charts in this JSON format:
                 print(f"⚠️ Failed to create {ch.get('type', 'unknown')} chart: {e}")
                 continue
 
-        # Fallback
+        # 🛡️ Fallback
         if not figs_html:
             numeric_cols = [col for col in df.columns if is_valid_numeric(col)]
             if len(numeric_cols) >= 2:
                 fig = px.bar(df, x=numeric_cols[0], y=numeric_cols[1], title="Fallback Bar Chart")
                 figs_html.append(fig.to_html(full_html=False))
 
-        # Scrollable chart display (for Jupyter/Colab)
+        # 🖥️ Horizontally scrollable chart block
         from IPython.display import display, HTML
         html_wrapper = f"""
         <div style="overflow-x: auto; white-space: nowrap;">
@@ -321,4 +332,3 @@ Suggest 0-5 charts in this JSON format:
     except Exception as e:
         print(f"🔥 Critical chart generation error: {e}")
         return []
-
