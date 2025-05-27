@@ -1,138 +1,141 @@
-def generate_charts_custom2(user_query: str, sql_query: str) -> list:
-    """
-    Same as before, but:
-      - Any column with ≤10 unique values can be used for grouping.
-      - No per-chart print() noise.
-    """
+def generate_charts_custom_scrollable(user_query: str, sql_query: str):
+    """Improved chart generation with scrollable layout and line chart date fix."""
     try:
-        # fetch latest CSV from Azure
         azure = AzureStorage()
         container = azure.client.get_container_client(AZURE_CONFIG["container"])
         blobs = sorted(
-            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
-            key=lambda b: b.creation_time, reverse=True
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
         )
         if not blobs:
             print("❌ No data available for chart generation.")
             return []
-        df = pd.read_csv(BytesIO(container.download_blob(blobs[0].name).readall()))
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+
         if df.empty:
             print("⚠️ The latest dataset is empty. No charts can be generated.")
             return []
 
-        # sample & stats
-        sample_df = df.sample(min(100, len(df)), random_state=42)
-        sample_md  = sample_df.to_markdown(index=False)
-        stats_md   = df.describe(include='all').to_markdown()
+        dtypes_summary = df.dtypes.astype(str).to_dict()
+        sample_rows = df.head(5).to_markdown(index=False)
 
-        # column roles
-        col_roles = {
-            col: ("date" if pd.api.types.is_datetime64_any_dtype(df[col])
-                  else "numeric" if pd.api.types.is_numeric_dtype(df[col])
-                  else "categorical")
-            for col in df.columns
-        }
+        prompt = f"""
+User Question: {user_query}
 
-        # build & send prompt (unchanged) …
-        prompt = f"""…"""  # same as before
+Generated SQL: {sql_query}
+
+Column Types: {json.dumps(dtypes_summary, indent=2)}
+
+Sample Data:
+{sample_rows}
+
+Suggest 0-5 charts in this JSON format:
+{{
+ "charts": [
+ {{
+   "type": "<bar|line|scatter|pie|treemap|heatmap>",
+   "x": "<column_name_for_x_axis>",
+   "y": "<column_name_for_y_axis>",
+   "z": "<optional_column_for_z_axis>",
+   "reason": "<why this chart is useful>"
+ }}
+ ]
+}}"""
+
         ai = AIService()
-        resp = ai.client.chat.completions.create(
+        response = ai.client.chat.completions.create(
             model=OPENAI_CONFIG["deployment"],
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
             max_tokens=800
         )
-        text = resp.choices[0].message.content.strip()
 
-        # extract JSON
+        text = response.choices[0].message.content.strip()
+
         try:
             match = re.search(r"\{.*\}", text, re.DOTALL)
             chart_json = json.loads(match.group(0)) if match else {}
-        except:
+        except Exception as e:
+            print(f"❌ JSON parsing error: {e}")
             chart_json = {}
 
         charts = chart_json.get("charts", [])
-        figs   = []
-        seen   = set()
+        if not charts:
+            print("⚠️ No charts suggested by the model.")
+            return []
 
-        def is_numeric(col):
-            return pd.api.types.is_numeric_dtype(df[col])
+        figs_html = []
+        seen_pairs = set()
+        valid_columns = set(df.columns)
 
-        # pick first small‐cardinality column that's not x or y
-        def pick_group(df, x, y):
-            for col in df.columns:
-                if col in (x, y): continue
-                if df[col].nunique() <= 10:
-                    return col
-            return None
+        def is_valid_numeric(col_name):
+            return col_name in df.columns and pd.api.types.is_numeric_dtype(df[col_name])
 
         for ch in charts:
-            c, x, y, z = ch.get("type"), ch.get("x"), ch.get("y"), ch.get("z")
-            if not all([c, x, y]) or (c, x, y) in seen:
-                continue
-            if x not in df or y not in df:
-                continue
-            if c == "pie" and df[x].nunique() > 10:
-                continue
-            if c == "line" and not (pd.api.types.is_datetime64_any_dtype(df[x]) or is_numeric(x)):
-                continue
-            if c in ["bar","line","scatter","heatmap","treemap","pie"] and not is_numeric(y):
+            try:
+                ctype = ch['type']
+                x = ch.get('x')
+                y = ch.get('y')
+                z = ch.get('z', None)
+                reason = ch.get('reason', f"{ctype} chart")
+
+                if (ctype, x, y) in seen_pairs:
+                    continue
+                if not x or not y or x not in valid_columns or y not in valid_columns:
+                    continue
+                if ctype in ['pie', 'bar', 'line', 'scatter', 'heatmap', 'treemap'] and not is_valid_numeric(y):
+                    continue
+                seen_pairs.add((ctype, x, y))
+
+                # 🔧 Fix for line chart datetime
+                if ctype == 'line':
+                    try:
+                        df[x] = pd.to_datetime(df[x], errors='coerce')
+                    except Exception:
+                        pass
+
+                if ctype == 'bar':
+                    fig = px.bar(df, x=x, y=y, title=reason)
+                elif ctype == 'line':
+                    fig = px.line(df, x=x, y=y, title=reason)
+                elif ctype == 'scatter':
+                    fig = px.scatter(df, x=x, y=y, title=reason)
+                elif ctype == 'pie':
+                    fig = px.pie(df, names=x, values=y, title=reason)
+                elif ctype == 'treemap':
+                    path = [p for p in [x, z] if p and p in valid_columns]
+                    fig = px.treemap(df, path=path, values=y, title=reason)
+                elif ctype == 'heatmap':
+                    fig = px.density_heatmap(df, x=x, y=y, z=z if z in valid_columns else None, title=reason)
+
+                figs_html.append(fig.to_html(full_html=False))
+
+            except Exception as e:
+                print(f"⚠️ Failed to create {ch.get('type', 'unknown')} chart: {e}")
                 continue
 
-            seen.add((c, x, y))
-            title = ch.get("reason", f"{c} of {y} vs {x}")
+        if not figs_html:
+            print("⚠️ No charts rendered. Adding fallback if numeric cols exist.")
+            numeric_cols = [col for col in df.columns if is_valid_numeric(col)]
+            if len(numeric_cols) >= 2:
+                fig = px.bar(df, x=numeric_cols[0], y=numeric_cols[1], title="Fallback Bar Chart")
+                figs_html.append(fig.to_html(full_html=False))
 
-            # build each chart
-            df_plot = df.copy()
-            if c == "bar":
-                fig = px.bar(df_plot, x=x, y=y, title=title)
-            elif c == "scatter":
-                fig = px.scatter(df_plot, x=x, y=y, title=title)
-            elif c == "pie":
-                fig = px.pie(df_plot, names=x, values=y, title=title)
-            elif c == "treemap":
-                path = [p for p in (x, z) if p in df_plot]
-                fig = px.treemap(df_plot, path=path, values=y, title=title)
-            elif c == "heatmap":
-                fig = px.density_heatmap(df_plot, x=x, y=y, z=z if z in df_plot else None, title=title)
-            elif c == "line":
-                df_line = df_plot.sort_values(by=x)
-                color = pick_group(df_line, x, y)
-                if color:
-                    fig = px.line(df_line, x=x, y=y, color=color, markers=True,
-                                  title=f"{title} (grouped by {color})")
-                else:
-                    fig = px.line(df_line, x=x, y=y, markers=True, title=title)
-            else:
-                continue
+        # 📜 Display all charts in a scrollable HTML div
+        from IPython.display import display, HTML
+        html_wrapper = f"""
+        <div style="overflow-x: scroll; white-space: nowrap;">
+            {''.join([f'<div style="display:inline-block; margin-right:20px;">{fig}</div>' for fig in figs_html])}
+        </div>
+        """
+        display(HTML(html_wrapper))
 
-            # scroll/pan config
-            fig.update_layout(
-                dragmode='pan',
-                autosize=False,
-                width=min(max(150*len(df_plot.columns),800),2000),
-                height=600,
-                margin=dict(l=20,r=20,t=30,b=20),
-                xaxis=dict(fixedrange=False, rangeslider=dict(visible=True)),
-                yaxis=dict(fixedrange=False)
-            )
-            fig.show(config={'scrollZoom':True,'displayModeBar':True})
-            figs.append(fig)
-
-        # fallback histograms
-        if not figs:
-            nums = [c for c in df.columns if is_numeric(c)]
-            for col in nums[:3]:
-                fig = px.histogram(df, x=col, title=f"Distribution of {col}")
-                fig.update_layout(dragmode='pan', autosize=False,
-                                  width=1000, height=600,
-                                  xaxis=dict(fixedrange=False),
-                                  yaxis=dict(fixedrange=False))
-                fig.show(config={'scrollZoom':True})
-                figs.append(fig)
-
-        return figs
+        return figs_html
 
     except Exception as e:
-        print(f"🔥 Chart generation error: {e}")
+        print(f"🔥 Critical chart generation error: {e}")
         return []
