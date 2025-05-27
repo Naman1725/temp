@@ -332,3 +332,105 @@ Suggest 0-5 charts in this JSON format:
     except Exception as e:
         print(f"🔥 Critical chart generation error: {e}")
         return []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def generate_insights(user_query: str, sql_query: str):
+    """Analyze full result with context of user's request"""
+    try:
+        # Fetch latest result CSV from Azure Blob Storage
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No results found")
+            return
+
+        latest = blobs[0]
+        data_bytes = container.download_blob(latest.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+
+        if df.empty:
+            print("Latest result is empty – nothing to analyze")
+            return
+
+        # Convert full DataFrame to markdown table (truncate safely if too large)
+        full_markdown = df.to_markdown(index=False)
+        if len(full_markdown) > 10000:  # limit token overload
+            full_markdown = full_markdown[:10000] + "\n\n[Truncated due to size...]"
+
+        # Build prompt including full data, user question, SQL
+        prompt = f"""
+User Question:
+{user_query}
+
+Generated SQL:
+{sql_query}
+
+Data Sample (full table or truncated):
+{full_markdown}
+
+Now, provide 5 concise bullet‑point insights that:
+  - Analyze this data,
+  - Clearly tie back to the user’s original request and SQL logic.
+Format each as:
+- [Insight] – [Why it matters]
+"""
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.7,
+            max_tokens=500
+        )
+
+        insights = response.choices[0].message.content.strip()
+        print("\n🔍 Key Insights:\n" + insights)
+
+    except Exception as e:
+        print(f"Insights error: {str(e)}")
+
