@@ -18,22 +18,22 @@ from openai import AzureOpenAI
 POSTGRES_CONFIG = {
     "host": "localhost",
     "port": "5432",
-    "database": "KChat3",
+    "database": "",
     "user": "postgres",
-    "password": "1718730naman"
+    "password": ""
 }
 
 AZURE_CONFIG = {
-    "conn_str": "DefaultEndpointsProtocol=https;AccountName=gptstgciuat;AccountKey=qtFH+t4+2VrW0fZJAYO+QG+f7kT1kALsVO@UPKKLFnd5bDiWzgZYYdwYazTGX4c/kJM6FIeyTkiP+AStXkaWsQ==;EndpointSuffix=core.windows.net",
-    "container": "fileupload-aashu",
-    "results_folder": "query_results"
+    "conn_str": "",
+    "container": "",
+    "results_folder": ""
 }
 
 OPENAI_CONFIG = {
-    "api_key": "888cf@ccab8445b39c6d8767a7e2c433",
-    "endpoint": "https://entgptaiuat.openai.azure.com",
-    "api_version": "2023-07-01-preview",
-    "deployment": "gpt-40-mini"
+    "api_key": "",
+    "endpoint": "",
+    "api_version": "",
+    "deployment": ""
 }
 
 
