@@ -1,7 +1,7 @@
-def GenerateBarChartsCustom(user_query: str, sql_query: str):
-    """Generate clean, responsive bar charts with smart grouping and scroll handling"""
+def GenerateBarChartsLLM(user_query: str, sql_query: str):
+    """LLM-guided bar chart generation with data schema, random sampling, and fallback messaging"""
     try:
-        # Step 1: Load latest result
+        # Load latest dataset
         azure = AzureStorage()
         container = azure.client.get_container_client(AZURE_CONFIG["container"])
         blobs = sorted(
@@ -10,7 +10,7 @@ def GenerateBarChartsCustom(user_query: str, sql_query: str):
             reverse=True
         )
         if not blobs:
-            print("❌ No data available for bar chart generation.")
+            print("❌ No data available.")
             return []
 
         latest_blob = blobs[0]
@@ -18,38 +18,112 @@ def GenerateBarChartsCustom(user_query: str, sql_query: str):
         df = pd.read_csv(BytesIO(data_bytes))
 
         if df.empty:
-            print("⚠️ The latest dataset is empty. Cannot generate bar charts.")
+            print("⚠️ Dataset is empty.")
             return []
 
-        # Step 2: Identify top candidate (categorical + numeric) pairs
-        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
-        categorical_cols = [col for col in df.columns if pd.api.types.is_string_dtype(df[col]) and df[col].nunique() <= 100]
+        # Schema summary
+        schema = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
 
-        if not numeric_cols or not categorical_cols:
-            print("❌ No valid (categorical, numeric) column pairs found.")
+        # Random sample of 100 rows
+        sample_rows = df.sample(n=min(100, len(df)), random_state=42).to_markdown(index=False)
+
+        # Prompt construction
+        prompt = f"""
+You are a smart data visualization assistant.
+Your job is to suggest meaningful **bar charts only** based on:
+1. The user's natural language question,
+2. The SQL query generated from it,
+3. The schema of the resulting data,
+4. A sample of the data (random 100 rows).
+
+Here is the context:
+User Query: {user_query}
+SQL Query: {sql_query}
+
+Data Schema (structure of the result table):
+{json.dumps(schema, indent=2)}
+
+Random Sample Rows:
+{sample_rows}
+
+Suggest up to 2 relevant bar charts in this JSON format:
+{{
+  "charts": [
+    {{
+      "x": "<categorical_column>",
+      "y": "<numeric_column>",
+      "reason": "Why this bar chart reveals useful insight"
+    }}
+  ]
+}}
+"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG['deployment'],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=700
+        )
+        raw = resp.choices[0].message.content.strip()
+
+        try:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            chart_json = json.loads(match.group(0)) if match else {}
+        except:
+            print("⚠️ Failed to parse LLM output.")
+            print("The data does not contain any meaningful patterns suitable for bar chart visualization.")
             return []
 
-        # Step 3: Generate bar chart(s) for top 2 pairs
+        charts = chart_json.get("charts", [])
+        if not charts:
+            print("⚠️ LLM did not suggest any bar charts.")
+            print("The data does not contain any meaningful patterns suitable for bar chart visualization.")
+            return []
+
+        # Plot charts
         figs = []
-        for cat_col in categorical_cols[:2]:
-            for num_col in numeric_cols[:1]:  # only 1 numeric per cat for now
-                grouped = df.groupby(cat_col)[num_col].sum().reset_index()
-                grouped = grouped.sort_values(by=num_col, ascending=False).head(50)
+        for ch in charts[:2]:
+            x = ch.get("x")
+            y = ch.get("y")
+            reason = ch.get("reason", f"{y} by {x}")
 
-                fig = px.bar(grouped, x=cat_col, y=num_col, title=f"{num_col} by {cat_col}")
-                fig.update_layout(
-                    font=dict(size=10),
-                    width=max(100 * len(grouped), 800),
-                    height=500,
-                    margin=dict(l=10, r=10, t=30, b=40),
-                    xaxis_tickangle=-45
-                )
-                fig.update_traces(marker=dict(size=10))
-                fig.show()
-                figs.append(fig)
+            if not x or not y or x not in df.columns or y not in df.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(df[y]):
+                continue
+            if pd.api.types.is_numeric_dtype(df[x]) or df[x].nunique() > 50:
+                continue
 
+            grouped = df.groupby(x)[y].sum().reset_index()
+            grouped = grouped.sort_values(by=y, ascending=False).head(30)
+
+            if grouped[y].max() == 0:
+                continue
+
+            fig = px.bar(grouped, x=x, y=y, title=reason)
+            fig.update_layout(
+                font=dict(size=10),
+                width=max(100 * len(grouped), 800),
+                height=500,
+                margin=dict(l=10, r=10, t=30, b=40),
+                xaxis_tickangle=-45
+            )
+            fig.show()
+            figs.append(fig)
+
+        if not figs:
+            print("The data does not contain any meaningful patterns suitable for bar chart visualization.")
         return figs
 
     except Exception as e:
-        print(f"🔥 Bar chart generation error: {e}")
+        print(f"🔥 LLM bar chart generation error: {e}")
+        print("The data does not contain any meaningful patterns suitable for bar chart visualization.")
         return []
