@@ -1,0 +1,55 @@
+def GenerateBarChartsCustom(user_query: str, sql_query: str):
+    """Generate clean, responsive bar charts with smart grouping and scroll handling"""
+    try:
+        # Step 1: Load latest result
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No data available for bar chart generation.")
+            return []
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data_bytes))
+
+        if df.empty:
+            print("⚠️ The latest dataset is empty. Cannot generate bar charts.")
+            return []
+
+        # Step 2: Identify top candidate (categorical + numeric) pairs
+        numeric_cols = [col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])]
+        categorical_cols = [col for col in df.columns if pd.api.types.is_string_dtype(df[col]) and df[col].nunique() <= 100]
+
+        if not numeric_cols or not categorical_cols:
+            print("❌ No valid (categorical, numeric) column pairs found.")
+            return []
+
+        # Step 3: Generate bar chart(s) for top 2 pairs
+        figs = []
+        for cat_col in categorical_cols[:2]:
+            for num_col in numeric_cols[:1]:  # only 1 numeric per cat for now
+                grouped = df.groupby(cat_col)[num_col].sum().reset_index()
+                grouped = grouped.sort_values(by=num_col, ascending=False).head(50)
+
+                fig = px.bar(grouped, x=cat_col, y=num_col, title=f"{num_col} by {cat_col}")
+                fig.update_layout(
+                    font=dict(size=10),
+                    width=max(100 * len(grouped), 800),
+                    height=500,
+                    margin=dict(l=10, r=10, t=30, b=40),
+                    xaxis_tickangle=-45
+                )
+                fig.update_traces(marker=dict(size=10))
+                fig.show()
+                figs.append(fig)
+
+        return figs
+
+    except Exception as e:
+        print(f"🔥 Bar chart generation error: {e}")
+        return []
