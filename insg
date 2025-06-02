@@ -1,0 +1,67 @@
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.chat_models import ChatOpenAI
+from langchain.chains.question_answering import load_qa_chain
+from langchain.text_splitter import CharacterTextSplitter
+
+def generate_full_insights_from_blob(user_query: str, sql_query: str):
+    """Generate full-data insights using LangChain on entire blob CSV"""
+    try:
+        # Step 1: Locate latest CSV in Azure Blob
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            [b for b in container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/")],
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No result blobs found.")
+            return
+
+        latest_blob = blobs[0]
+        data_bytes = container.download_blob(latest_blob.name).readall()
+
+        # Step 2: Save locally
+        local_path = "temp_full_dataset.csv"
+        with open(local_path, "wb") as f:
+            f.write(data_bytes)
+
+        # Step 3: Load CSV into LangChain
+        loader = CSVLoader(file_path=local_path)
+        docs = loader.load()
+
+        # Step 4: Split for large input handling
+        splitter = CharacterTextSplitter(chunk_size=3000, chunk_overlap=300)
+        split_docs = splitter.split_documents(docs)
+
+        # Step 5: Setup LangChain with map_reduce strategy
+        llm = ChatOpenAI(
+            openai_api_key=OPENAI_CONFIG["api_key"],
+            openai_api_base=OPENAI_CONFIG["endpoint"],
+            openai_api_version=OPENAI_CONFIG["api_version"],
+            deployment_name=OPENAI_CONFIG["deployment"]
+        )
+        chain = load_qa_chain(llm, chain_type="map_reduce")
+
+        # Step 6: Build insight prompt
+        question = f"""
+The following SQL query was generated from the user question:
+"{user_query}"
+
+SQL Logic:
+{sql_query}
+
+Please provide 5 comprehensive insights from the full dataset relevant to this logic. Highlight trends, anomalies, comparisons, or any meaningful patterns.
+Each insight should follow this format:
+- [Insight] – [Why it matters]
+"""
+
+        # Step 7: Run the chain
+        response = chain.run(input_documents=split_docs, question=question)
+
+        # Step 8: Output
+        print("\n📊 Full-Data Insights (LangChain MapReduce):\n")
+        print(response)
+
+    except Exception as e:
+        print(f"❌ Full-data insight generation failed: {e}")
