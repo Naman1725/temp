@@ -1,0 +1,108 @@
+pip install langchain faiss-cpu openai azure-storage-blob pandas python-dotenv
+
+
+import os
+import json
+import pandas as pd
+from io import BytesIO
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from azure.storage.blob import BlobServiceClient
+
+# ---------------------
+# Configuration (Fill These)
+# ---------------------
+AZURE_CONFIG = {
+    "conn_str": "<your-azure-blob-connection-string>",
+    "container": "<your-container-name>",
+    "results_folder": "<your-results-folder>"
+}
+
+OPENAI_CONFIG = {
+    "api_key": "<your-openai-api-key>",
+    "endpoint": "<your-azure-endpoint>",  # e.g. https://xyz.openai.azure.com
+    "api_version": "<your-api-version>",  # e.g. 2024-04-01-preview
+    "deployment": "<your-deployment-name>"  # e.g. gpt-4o-mini
+}
+
+# ---------------------
+# Azure Blob Loader
+# ---------------------
+def get_latest_csv_blob():
+    blob_service = BlobServiceClient.from_connection_string(AZURE_CONFIG["conn_str"])
+    container = blob_service.get_container_client(AZURE_CONFIG["container"])
+    blobs = sorted(
+        container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+        key=lambda b: b.creation_time,
+        reverse=True
+    )
+    if not blobs:
+        print("❌ No blob file found.")
+        return None
+
+    latest_blob = blobs[0]
+    blob_data = container.download_blob(latest_blob.name).readall()
+
+    local_path = "temp_rag_latest.csv"
+    with open(local_path, "wb") as f:
+        f.write(blob_data)
+    return local_path
+
+# ---------------------
+# RAG Insight Generator
+# ---------------------
+def generate_insights_rag(user_query: str, sql_query: str):
+    try:
+        local_csv_path = get_latest_csv_blob()
+        if not local_csv_path:
+            return
+
+        # Step 1: Load CSV as documents
+        loader = CSVLoader(file_path=local_csv_path)
+        raw_docs = loader.load()
+
+        # Step 2: Split into chunks
+        splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        split_docs = splitter.split_documents(raw_docs)
+
+        # Step 3: Embed and store
+        embeddings = OpenAIEmbeddings(
+            openai_api_key=OPENAI_CONFIG["api_key"],
+            openai_api_base=OPENAI_CONFIG["endpoint"],
+            openai_api_version=OPENAI_CONFIG["api_version"]
+        )
+        vectorstore = FAISS.from_documents(split_docs, embeddings)
+
+        # Step 4: Setup retriever + LLM
+        retriever = vectorstore.as_retriever()
+        llm = ChatOpenAI(
+            openai_api_key=OPENAI_CONFIG["api_key"],
+            openai_api_base=OPENAI_CONFIG["endpoint"],
+            openai_api_version=OPENAI_CONFIG["api_version"],
+            azure_deployment=OPENAI_CONFIG["deployment"]
+        )
+
+        chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever, chain_type="stuff")
+
+        # Step 5: Ask insight-based question
+        question = f"""
+        Based on the result of the following SQL query:
+        {sql_query}
+
+        Which was generated in response to the user's question:
+        "{user_query}"
+
+        Please provide 5 key insights from the dataset.
+        Format:
+        - [Insight] – [Why it matters]
+        """
+
+        response = chain.run(question)
+        print("\n🔍 RAG-Based Insights:\n", response)
+
+    except Exception as e:
+        print(f"❌ RAG insight generation failed: {str(e)}")
