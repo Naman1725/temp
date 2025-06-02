@@ -1,0 +1,56 @@
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.chat_models import ChatOpenAI
+from langchain.chains.question_answering import load_qa_chain
+
+def generate_insights_rag(user_query: str, sql_query: str):
+    """RAG-style insights using full CSV from Azure Blob via LangChain"""
+    try:
+        # Step 1: Get latest blob
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda x: x.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No blob file found.")
+            return
+
+        latest_blob = blobs[0]
+        blob_data = container.download_blob(latest_blob.name).readall()
+        local_path = "temp_latest.csv"
+        with open(local_path, "wb") as f:
+            f.write(blob_data)
+
+        # Step 2: Load CSV as LangChain docs
+        loader = CSVLoader(file_path=local_path)
+        docs = loader.load()
+
+        # Step 3: LangChain model setup
+        llm = ChatOpenAI(
+            openai_api_key=OPENAI_CONFIG["api_key"],
+            openai_api_base=OPENAI_CONFIG["endpoint"],
+            openai_api_version=OPENAI_CONFIG["api_version"],
+            azure_deployment=OPENAI_CONFIG["deployment"]
+        )
+
+        chain = load_qa_chain(llm, chain_type="stuff")
+
+        # Step 4: Ask insight question
+        question = f"""Based on the result of the following SQL query:
+{sql_query}
+
+Which was generated in response to the user's question:
+"{user_query}"
+
+Please provide 5 insights about the dataset that reflect trends, anomalies, or observations related to the query logic.
+Format:
+- [Insight] – [Why it matters]
+"""
+
+        response = chain.run(input_documents=docs, question=question)
+        print("\n🔍 LangChain RAG Insights:\n", response)
+
+    except Exception as e:
+        print(f"❌ RAG insight generation failed: {str(e)}")
