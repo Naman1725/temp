@@ -1,5 +1,15 @@
 pip install langchain faiss-cpu openai azure-storage-blob pandas python-dotenv
-
+import os
+import json
+import pandas as pd
+from io import BytesIO
+from langchain.document_loaders.csv_loader import CSVLoader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.chat_models import ChatOpenAI
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains import RetrievalQA
+from azure.storage.blob import BlobServiceClient
 
 
 def get_latest_csv_blob():
