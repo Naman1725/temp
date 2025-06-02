@@ -1,0 +1,52 @@
+def generate_insights_using_langchain(user_query, sql_query):
+    """
+    Generate 5 key insights using LangChain from the latest Azure CSV result.
+    Optimized for large files using map_reduce and chunking.
+    """
+    try:
+        print("🔄 Generating SAS URL for latest result CSV from Azure Blob...")
+        sas_url = generate_latest_blob_sas_url()
+        if not sas_url:
+            print("❌ Could not generate SAS URL.")
+            return
+
+        print("📥 Downloading CSV from SAS URL...")
+        local_csv = download_csv_from_sas_url(sas_url)
+        if not os.path.exists(local_csv):
+            print("❌ Failed to download CSV.")
+            return
+
+        print("📊 Loading CSV into LangChain using chunked loader...")
+        loader = CSVLoader(file_path=local_csv, csv_args={"chunksize": 100})
+        docs = loader.load()
+        print(f"✅ CSV loaded with {len(docs)} document chunks.")
+
+        print("🧠 Initializing Azure OpenAI model via LangChain...")
+        llm = ChatOpenAI(
+            openai_api_key=OPENAI_CONFIG["api_key"],
+            openai_api_base=OPENAI_CONFIG["endpoint"],
+            openai_api_version=OPENAI_CONFIG["api_version"],
+            deployment_name=OPENAI_CONFIG["deployment"]
+        )
+
+        print("⚙️ Running map_reduce chain for full dataset analysis...")
+        chain = load_qa_chain(llm, chain_type="map_reduce")
+
+        question = f"""Based on the result of the following SQL query:
+{sql_query}
+
+Which was generated in response to the user's question:
+"{user_query}"
+
+Please provide 5 key insights about the dataset that reflect trends, anomalies, or observations directly relevant to the query logic.
+Format as:
+- [Insight] – [Why it matters]
+"""
+
+        response = chain.run(input_documents=docs, question=question)
+
+        print("\n🔍 LangChain-Powered Insights:\n")
+        print(response)
+
+    except Exception as e:
+        print(f"❌ LangChain insights generation failed:\n{str(e)}")
