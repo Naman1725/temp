@@ -1,0 +1,119 @@
+def generate_professional_bar_charts(user_query: str, sql_query: str):
+    """
+    Generate up to 5 clean, horizontally-scrollable bar charts from latest blob.
+    Focuses on meaningful, user-aligned visuals and handles messy x-axes.
+    """
+    try:
+        # Step 1: Fetch latest dataset
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No blob found.")
+            return []
+
+        latest_blob = blobs[0]
+        data = container.download_blob(latest_blob.name).readall()
+        df = pd.read_csv(BytesIO(data))
+        if df.empty:
+            print("⚠️ Latest dataset is empty.")
+            return []
+
+        # Step 2: Prepare metadata + sample for LLM
+        schema = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_null": int(df[col].notna().sum()),
+                "unique": int(df[col].nunique())
+            } for col in df.columns
+        }
+
+        sample = df.sample(min(100, len(df)), random_state=42).to_markdown(index=False)
+
+        # Step 3: Prompt LLM
+        prompt = f"""
+You are a data visualization expert. Suggest up to 5 meaningful bar charts using this dataset.
+IMPORTANT:
+- Focus only on bar charts.
+- Use only valid (low-cardinality) categorical columns for X-axis.
+- Use numeric columns for Y-axis.
+- Do not suggest private/sensitive fields (like token, password, card, etc).
+- Align chart suggestions with user's query and SQL.
+
+User Query: {user_query}
+SQL Query: {sql_query}
+
+Schema:
+{json.dumps(schema, indent=2)}
+
+Sample Data (random 100 rows):
+{sample}
+
+Respond in this JSON format:
+{{
+  "charts": [
+    {{
+      "x": "<categorical_column>",
+      "y": "<numeric_column>",
+      "reason": "Why this chart helps"
+    }}
+  ]
+}}
+"""
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800
+        )
+
+        raw = response.choices[0].message.content.strip()
+        try:
+            chart_data = json.loads(re.search(r"\{.*\}", raw, re.DOTALL).group(0))
+        except Exception as e:
+            print(f"❌ Failed to parse chart JSON: {e}")
+            return []
+
+        charts = chart_data.get("charts", [])
+        if not charts:
+            print("⚠️ No valid charts suggested.")
+            return []
+
+        # Step 4: Generate charts
+        figs = []
+        for ch in charts[:5]:
+            x = ch.get("x")
+            y = ch.get("y")
+            reason = ch.get("reason", f"{y} by {x}")
+
+            if x not in df.columns or y not in df.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(df[y]):
+                continue
+            if df[x].nunique() > 50 or pd.api.types.is_numeric_dtype(df[x]):
+                continue
+
+            grouped = df.groupby(x)[y].sum().reset_index()
+            grouped = grouped.sort_values(by=y, ascending=False).head(30)
+
+            fig = px.bar(grouped, x=x, y=y, title=reason)
+            fig.update_layout(
+                xaxis_tickangle=-45,
+                font=dict(size=10),
+                height=500,
+                width=max(100 * len(grouped), 1000),  # Horizontal scroll handling
+                margin=dict(l=10, r=10, t=30, b=60)
+            )
+            fig.show()
+            figs.append(fig)
+
+        return figs
+
+    except Exception as e:
+        print(f"🔥 Error generating professional bar charts: {e}")
+        return []
