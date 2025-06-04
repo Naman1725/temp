@@ -1,0 +1,117 @@
+def generate_heatmap1(user_query: str, sql_query: str):
+    """
+    LLM-guided heatmap generation with metadata, validation, and robust fallback.
+    """
+    try:
+        # Step 1: Load latest CSV from Azure Blob
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("❌ No data available in blob storage.")
+            return
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+
+        if df.empty:
+            print("⚠️ Dataset is empty. Heatmap not possible.")
+            return
+
+        # Step 2: Prepare metadata and sample
+        sample = df.sample(n=min(30, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        # Step 3: Construct LLM Prompt
+        prompt = f"""
+You are a data visualization expert. Based on the data sample and metadata below, determine if a meaningful heatmap can be created.
+
+User Question: {user_query}
+SQL Query: {sql_query}
+
+Column Metadata:
+{json.dumps(metadata, indent=2)}
+
+Sample Data (30 random rows):
+{sample}
+
+Return this JSON if heatmap is meaningful:
+{{
+  "heatmap": {{
+    "x": "<column1>",
+    "y": "<column2>",
+    "z": "<optional_column>",  // can be null
+    "reason": "Why this heatmap helps explain the data"
+  }}
+}}
+
+If a heatmap is not suitable, respond with:
+{{ "heatmap": null }}
+"""
+
+        # Step 4: Query LLM
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=800
+        )
+        text = resp.choices[0].message.content.strip()
+
+        # Step 5: Parse LLM JSON
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        heatmap_json = json.loads(match.group(0)) if match else {}
+
+        if not heatmap_json or not heatmap_json.get("heatmap"):
+            print("❌ Heatmap could not be generated for this dataset.")
+            return
+
+        heatmap_cfg = heatmap_json["heatmap"]
+        x, y, z = heatmap_cfg.get("x"), heatmap_cfg.get("y"), heatmap_cfg.get("z")
+        reason = heatmap_cfg.get("reason", "Heatmap Visualization")
+
+        # Step 6: Validation
+        if not x or not y or x not in df.columns or y not in df.columns:
+            print("❌ Invalid column suggestions. Cannot generate heatmap.")
+            return
+        if z and z not in df.columns:
+            z = None  # ignore z if invalid
+
+        # Limit high-cardinality columns
+        if df[x].nunique() > 50 or df[y].nunique() > 50:
+            print("⚠️ Too many unique values for meaningful heatmap.")
+            return
+
+        # Step 7: Plot Heatmap
+        fig = px.density_heatmap(
+            df,
+            x=x,
+            y=y,
+            z=z if z else None,
+            title=reason,
+            color_continuous_scale="Viridis"
+        )
+        fig.update_layout(
+            width=900,
+            height=600,
+            margin=dict(l=10, r=10, t=30, b=40),
+            xaxis_title=x,
+            yaxis_title=y
+        )
+        fig.show()
+
+    except Exception as e:
+        print(f"🔥 Heatmap generation error: {e}")
+        print("❌ Heatmap could not be created over this dataset.")
