@@ -1,0 +1,124 @@
+def generate_bar_graph1(user_query: str, sql_query: str):
+    """
+    Generates up to 5 LLM-guided bar charts based on latest blob data,
+    schema metadata, random sample rows, and user query context.
+    Ensures horizontal scroll and avoids messy overcrowded charts.
+    """
+    try:
+        # Step 1: Load latest dataset
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print(" No data available.")
+            return []
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+
+        if df.empty:
+            print("️ Dataset is empty.")
+            return []
+
+        # Step 2: Prepare metadata and sample
+        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        # Step 3: Prompt LLM for bar chart suggestions
+        prompt = f"""
+You are a smart data visualization assistant.
+
+Based on:
+- The user’s natural language question: "{user_query}"
+- The SQL query generated: {sql_query}
+- The metadata of the dataset (full)
+- A random 40-row sample (below)
+
+Suggest between 0 and 5 useful **bar charts** that are most helpful in visualizing this data. Prioritize suggestions that relate to the user question.
+
+Only respond with this exact JSON format:
+{{
+  "charts": [
+    {{
+      "x": "<categorical_column>",
+      "y": "<numeric_column>",
+      "reason": "<why this chart is useful>"
+    }}
+  ]
+}}
+
+Metadata:
+{json.dumps(metadata, indent=2)}
+
+️ Sample Data (not full dataset):
+{sample}
+"""
+
+        ai = AIService()
+        response = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG['deployment'],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.4,
+            max_tokens=800
+        )
+        raw = response.choices[0].message.content.strip()
+
+        # Step 4: Parse JSON safely
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        chart_json = json.loads(match.group(0)) if match else {}
+
+        charts = chart_json.get("charts", [])
+        if not charts:
+            print("️ No bar charts suggested by the model.")
+            return []
+
+        figs = []
+        for ch in charts:
+            x = ch.get("x")
+            y = ch.get("y")
+            reason = ch.get("reason", f"{y} by {x}")
+
+            # Validation
+            if not x or not y or x not in df.columns or y not in df.columns:
+                continue
+            if not pd.api.types.is_numeric_dtype(df[y]):
+                continue
+            if pd.api.types.is_numeric_dtype(df[x]) or df[x].nunique() > 50:
+                continue
+
+            grouped = df.groupby(x)[y].sum().reset_index()
+            grouped = grouped.sort_values(by=y, ascending=False).head(30)
+
+            if grouped[y].max() == 0:
+                continue
+
+            fig = px.bar(grouped, x=x, y=y, title=reason)
+            fig.update_layout(
+                font=dict(size=10),
+                width=max(100 * len(grouped), 800),  # Horizontal scroll support
+                height=500,
+                margin=dict(l=10, r=10, t=30, b=40),
+                xaxis_tickangle=-45
+            )
+            fig.show()
+            figs.append(fig)
+
+        if not figs:
+            print("️ No valid bar charts could be created from the model suggestions.")
+
+        return figs
+
+    except Exception as e:
+        print(f" Bar chart generation error: {e}")
+        return []
