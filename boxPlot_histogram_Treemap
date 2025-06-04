@@ -1,0 +1,246 @@
+generate_treemap1, generate_histogram1, generate_box_plot1
+
+def generate_box_plot1(user_query: str, sql_query: str):
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No data available.")
+            return
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+        if df.empty:
+            print("Dataset is empty.")
+            return
+
+        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        prompt = f"""
+Suggest one meaningful box plot based on the following context:
+
+User Query: {user_query}
+SQL Query: {sql_query}
+Metadata: {json.dumps(metadata, indent=2)}
+Sample (random 40 rows, not full dataset):
+{sample}
+
+Respond with JSON:
+{{
+  "boxplot": {{
+    "x": "<category_column>",
+    "y": "<numeric_column>",
+    "reason": "Why this is useful"
+  }}
+}}
+
+If not suitable, respond: {{ "boxplot": null }}
+"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        text = resp.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        plot_cfg = json.loads(match.group(0)) if match else {}
+
+        if not plot_cfg or not plot_cfg.get("boxplot"):
+            print("Not possible to generate box plot.")
+            return
+
+        cfg = plot_cfg["boxplot"]
+        x, y = cfg.get("x"), cfg.get("y")
+        reason = cfg.get("reason", f"{y} by {x}")
+
+        if not x or not y or x not in df.columns or y not in df.columns:
+            print("Invalid column names suggested.")
+            return
+
+        if not pd.api.types.is_numeric_dtype(df[y]) or df[x].nunique() > 50:
+            print("Box plot not possible due to unsuitable columns.")
+            return
+
+        fig = px.box(df, x=x, y=y, title=reason)
+        fig.show()
+
+    except Exception as e:
+        print(f"Error generating box plot: {e}")
+        print("Not possible to generate box plot.")
+
+
+def generate_histogram1(user_query: str, sql_query: str):
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No data available.")
+            return
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+        if df.empty:
+            print("Dataset is empty.")
+            return
+
+        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        prompt = f"""
+Suggest one meaningful histogram to analyze distribution of a numeric column.
+
+User Query: {user_query}
+SQL Query: {sql_query}
+Metadata: {json.dumps(metadata, indent=2)}
+Sample (random 40 rows, not full dataset):
+{sample}
+
+Return JSON like:
+{{ "histogram": {{ "x": "<numeric_column>", "reason": "why this matters" }} }}
+
+If not suitable, return: {{ "histogram": null }}
+"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        text = resp.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        plot_cfg = json.loads(match.group(0)) if match else {}
+
+        if not plot_cfg or not plot_cfg.get("histogram"):
+            print("Not possible to generate histogram.")
+            return
+
+        cfg = plot_cfg["histogram"]
+        x = cfg.get("x")
+        reason = cfg.get("reason", f"Distribution of {x}")
+
+        if not x or x not in df.columns or not pd.api.types.is_numeric_dtype(df[x]):
+            print("Histogram not possible due to unsuitable column.")
+            return
+
+        fig = px.histogram(df, x=x, title=reason)
+        fig.show()
+
+    except Exception as e:
+        print(f"Error generating histogram: {e}")
+        print("Not possible to generate histogram.")
+
+
+def generate_treemap1(user_query: str, sql_query: str):
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No data available.")
+            return
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+        if df.empty:
+            print("Dataset is empty.")
+            return
+
+        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        prompt = f"""
+Suggest a meaningful treemap using 1 or 2 categorical columns and 1 numeric column.
+
+User Query: {user_query}
+SQL Query: {sql_query}
+Metadata: {json.dumps(metadata, indent=2)}
+Sample (random 40 rows, not full dataset):
+{sample}
+
+Respond with JSON:
+{{
+  "treemap": {{
+    "path": ["<category1>", "<category2_optional>"],
+    "values": "<numeric_column>",
+    "reason": "Why this treemap helps visualize the data"
+  }}
+}}
+
+If treemap is not appropriate, return: {{ "treemap": null }}
+"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        text = resp.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        plot_cfg = json.loads(match.group(0)) if match else {}
+
+        if not plot_cfg or not plot_cfg.get("treemap"):
+            print("Not possible to generate treemap.")
+            return
+
+        cfg = plot_cfg["treemap"]
+        path = cfg.get("path", [])
+        values = cfg.get("values")
+        reason = cfg.get("reason", "Treemap Visualization")
+
+        if not path or not values or any(p not in df.columns for p in path) or values not in df.columns:
+            print("Invalid column suggestions for treemap.")
+            return
+
+        if not pd.api.types.is_numeric_dtype(df[values]):
+            print("Treemap not possible: value column is not numeric.")
+            return
+
+        fig = px.treemap(df, path=path, values=values, title=reason)
+        fig.show()
+
+    except Exception as e:
+        print(f"Error generating treemap: {e}")
+        print("Not possible to generate treemap.")
