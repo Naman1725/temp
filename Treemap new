@@ -1,5 +1,6 @@
-def generate_treemap1_with_aggregation(user_query: str, sql_query: str, top_n: int = 30):
+def generate_treemap_clean_top10(user_query: str, sql_query: str):
     try:
+        # Step 1: Load latest data
         azure = AzureStorage()
         container = azure.client.get_container_client(AZURE_CONFIG["container"])
         blobs = sorted(
@@ -17,98 +18,42 @@ def generate_treemap1_with_aggregation(user_query: str, sql_query: str, top_n: i
             print("Dataset is empty.")
             return
 
-        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
-        metadata = {
-            col: {
-                "dtype": str(df[col].dtype),
-                "non_nulls": int(df[col].notna().sum()),
-                "unique_values": int(df[col].nunique())
-            }
-            for col in df.columns
-        }
+        # Step 2: Filter categorical columns and select only top one by frequency
+        categorical_cols = [
+            col for col in df.columns
+            if df[col].dtype == "object" or df[col].dtype.name == "category"
+        ]
+        if not categorical_cols:
+            print("No categorical columns found for treemap.")
+            return
 
-        prompt = f"""
-Suggest a meaningful treemap using 1 or 2 categorical columns and 1 numeric column.
+        # Step 3: Choose most frequent categorical column
+        top_cat_col = max(categorical_cols, key=lambda col: df[col].nunique())
+        cat_counts = df[top_cat_col].value_counts()
 
-User Query: {user_query}
-SQL Query: {sql_query}
-Metadata: {json.dumps(metadata, indent=2)}
-Sample (random 40 rows, not full dataset):
-{sample}
+        # Step 4: Lump low-frequency values into "Other"
+        top_categories = cat_counts.head(10).index.tolist()
+        df[top_cat_col] = df[top_cat_col].apply(lambda x: x if x in top_categories else "Other")
 
-Respond with JSON:
-{{
-  "treemap": {{
-    "path": ["<category1>", "<category2_optional>"],
-    "values": "<numeric_column>",
-    "reason": "Why this treemap helps visualize the data"
-  }}
-}}
+        # Step 5: Select one numeric column
+        numeric_cols = df.select_dtypes(include='number').columns.tolist()
+        if not numeric_cols:
+            print("No numeric column available for value sizing.")
+            return
+        value_col = numeric_cols[0]
 
-If treemap is not appropriate, return: {{ "treemap": null }}
-"""
+        # Step 6: Group and summarize data
+        grouped_df = df.groupby(top_cat_col, as_index=False)[value_col].sum()
 
-        ai = AIService()
-        resp = ai.client.chat.completions.create(
-            model=OPENAI_CONFIG["deployment"],
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=500
+        # Step 7: Plot treemap
+        fig = px.treemap(
+            grouped_df,
+            path=[top_cat_col],
+            values=value_col,
+            title=f"Treemap: {value_col} by {top_cat_col} (Top 10 + Other)"
         )
-        text = resp.choices[0].message.content.strip()
-        match = re.search(r"\{.*\}", text, re.DOTALL)
-        plot_cfg = json.loads(match.group(0)) if match else {}
-
-        if not plot_cfg or not plot_cfg.get("treemap"):
-            print("Not possible to generate treemap.")
-            return
-
-        cfg = plot_cfg["treemap"]
-        path = cfg.get("path", [])
-        values = cfg.get("values")
-        reason = cfg.get("reason", "Treemap Visualization")
-
-        if not path or not values or any(p not in df.columns for p in path) or values not in df.columns:
-            print("Invalid column suggestions for treemap.")
-            return
-
-        if not pd.api.types.is_numeric_dtype(df[values]):
-            print("Treemap not possible: value column is not numeric.")
-            return
-
-        # ----------- Aggregation Step -----------
-        grouped = (
-            df
-            .groupby(path, as_index=False)[values]
-            .sum()
-            .sort_values(values, ascending=False)
-        )
-
-        top_groups = grouped.head(top_n).copy()
-        others = grouped.tail(len(grouped) - top_n)
-
-        if others.empty:
-            plot_df = top_groups
-        else:
-            if len(path) == 1:
-                others_row = {
-                    path[0]: "Other",
-                    values: others[values].sum()
-                }
-                others_df = pd.DataFrame([others_row])
-            else:
-                others_df = (
-                    others
-                    .groupby([path[0]], as_index=False)[values]
-                    .sum()
-                )
-                others_df[path[1]] = "Other"
-
-            plot_df = pd.concat([top_groups, others_df], ignore_index=True)
-
-        fig = px.treemap(plot_df, path=path, values=values, title=reason)
         fig.show()
 
     except Exception as e:
         print(f"Error generating treemap: {e}")
-        print("Not possible to generate treemap.")
+        print("Not possible to generate clean treemap.")
