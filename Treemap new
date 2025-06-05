@@ -1,0 +1,114 @@
+def generate_treemap1_with_aggregation(user_query: str, sql_query: str, top_n: int = 30):
+    try:
+        azure = AzureStorage()
+        container = azure.client.get_container_client(AZURE_CONFIG["container"])
+        blobs = sorted(
+            container.list_blobs(name_starts_with=f"{AZURE_CONFIG['results_folder']}/"),
+            key=lambda b: b.creation_time,
+            reverse=True
+        )
+        if not blobs:
+            print("No data available.")
+            return
+
+        latest_blob = blobs[0]
+        df = pd.read_csv(BytesIO(container.download_blob(latest_blob.name).readall()))
+        if df.empty:
+            print("Dataset is empty.")
+            return
+
+        sample = df.sample(n=min(40, len(df)), random_state=42).to_markdown(index=False)
+        metadata = {
+            col: {
+                "dtype": str(df[col].dtype),
+                "non_nulls": int(df[col].notna().sum()),
+                "unique_values": int(df[col].nunique())
+            }
+            for col in df.columns
+        }
+
+        prompt = f"""
+Suggest a meaningful treemap using 1 or 2 categorical columns and 1 numeric column.
+
+User Query: {user_query}
+SQL Query: {sql_query}
+Metadata: {json.dumps(metadata, indent=2)}
+Sample (random 40 rows, not full dataset):
+{sample}
+
+Respond with JSON:
+{{
+  "treemap": {{
+    "path": ["<category1>", "<category2_optional>"],
+    "values": "<numeric_column>",
+    "reason": "Why this treemap helps visualize the data"
+  }}
+}}
+
+If treemap is not appropriate, return: {{ "treemap": null }}
+"""
+
+        ai = AIService()
+        resp = ai.client.chat.completions.create(
+            model=OPENAI_CONFIG["deployment"],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+            max_tokens=500
+        )
+        text = resp.choices[0].message.content.strip()
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        plot_cfg = json.loads(match.group(0)) if match else {}
+
+        if not plot_cfg or not plot_cfg.get("treemap"):
+            print("Not possible to generate treemap.")
+            return
+
+        cfg = plot_cfg["treemap"]
+        path = cfg.get("path", [])
+        values = cfg.get("values")
+        reason = cfg.get("reason", "Treemap Visualization")
+
+        if not path or not values or any(p not in df.columns for p in path) or values not in df.columns:
+            print("Invalid column suggestions for treemap.")
+            return
+
+        if not pd.api.types.is_numeric_dtype(df[values]):
+            print("Treemap not possible: value column is not numeric.")
+            return
+
+        # ----------- Aggregation Step -----------
+        grouped = (
+            df
+            .groupby(path, as_index=False)[values]
+            .sum()
+            .sort_values(values, ascending=False)
+        )
+
+        top_groups = grouped.head(top_n).copy()
+        others = grouped.tail(len(grouped) - top_n)
+
+        if others.empty:
+            plot_df = top_groups
+        else:
+            if len(path) == 1:
+                others_row = {
+                    path[0]: "Other",
+                    values: others[values].sum()
+                }
+                others_df = pd.DataFrame([others_row])
+            else:
+                others_df = (
+                    others
+                    .groupby([path[0]], as_index=False)[values]
+                    .sum()
+                )
+                others_df[path[1]] = "Other"
+
+            plot_df = pd.concat([top_groups, others_df], ignore_index=True)
+
+        fig = px.treemap(plot_df, path=path, values=values, title=reason)
+        fig.show()
+
+    except Exception as e:
+        print(f"Error generating treemap: {e}")
+        print("Not possible to generate treemap.")
